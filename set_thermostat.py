@@ -1,4 +1,4 @@
-#!/Users/daniel/Documents/GitHub/iot_honeywellhome/.venv/bin/python3
+#!/usr/bin/env python3
 
 import argparse
 import json
@@ -10,6 +10,7 @@ import datetime
 from dotenv import load_dotenv
 import time
 from pushover_complete import PushoverAPI
+import traceback
 
 # Load environment variables from .env file
 load_dotenv()
@@ -31,13 +32,26 @@ class HoneywellThermostat:
         self.location_id = None
         self.zone_id = None
 
-    def send_notification(self, message: str, title: str = "Thermostat Update"):
+    def send_notification(self, message: str, title: str = "Thermostat Update", priority: int = 0):
         """Send a notification via Pushover."""
         if self.pushover:
             try:
-                self.pushover.send_message(user=os.getenv('PUSHOVER_USER_KEY'), message=message, title=title)
+                self.pushover.send_message(
+                    user=os.getenv('PUSHOVER_USER_KEY'),
+                    message=message,
+                    title=title,
+                    priority=priority
+                )
             except Exception as e:
                 print(f"Failed to send notification: {e}")
+                print(traceback.format_exc())
+
+    def send_error_notification(self, error_msg: str, trace: str = None):
+        """Send an error notification with stack trace via Pushover."""
+        message = f"Error: {error_msg}"
+        if trace:
+            message += f"\n\nStack trace:\n{trace}"
+        self.send_notification(message, title="Thermostat Error", priority=1)
 
     def login(self) -> bool:
         """Login to the Honeywell service."""
@@ -64,6 +78,7 @@ class HoneywellThermostat:
             return True
         except requests.exceptions.RequestException as e:
             print(f"Login failed: {e}")
+            self.send_error_notification(f"Login failed: {e}")
             return False
 
     def get_locations(self) -> Optional[str]:
@@ -94,8 +109,10 @@ class HoneywellThermostat:
                 return self.location_id
         except requests.exceptions.RequestException as e:
             print(f"Failed to get locations: {e}")
+            self.send_error_notification(f"Failed to get locations: {e}")
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             print(f"Failed to parse location data: {e}")
+            self.send_error_notification(f"Failed to parse location data: {e}")
         
         return None
 
@@ -103,6 +120,7 @@ class HoneywellThermostat:
         """Get the system information for the location."""
         if not self.location_id:
             print("No location ID available")
+            self.send_error_notification("No location ID available")
             return None
             
         # We don't need to make another API call since we already have the zone ID
@@ -112,6 +130,7 @@ class HoneywellThermostat:
         """Get the current zone status including temperatures."""
         if not self.zone_id:
             print("No zone ID available")
+            self.send_error_notification("No zone ID available")
             return None
             
         # Get locations again as it contains the current temperature info
@@ -131,8 +150,10 @@ class HoneywellThermostat:
                     }
         except requests.exceptions.RequestException as e:
             print(f"Failed to get zone status: {e}")
+            self.send_error_notification(f"Failed to get zone status: {e}")
         except json.JSONDecodeError as e:
             print(f"Failed to parse zone status: {e}")
+            self.send_error_notification(f"Failed to parse zone status: {e}")
         
         return None
 
@@ -148,12 +169,14 @@ class HoneywellThermostat:
             return current_temp, setpoint
         except (ValueError, TypeError, KeyError) as e:
             print(f"Failed to parse temperature data: {e}")
+            self.send_error_notification(f"Failed to parse temperature data: {e}")
             return None, None
 
     def set_temperature(self, temp_celsius: float) -> bool:
         """Set the target temperature in Celsius."""
         if not self.zone_id:
             print("No zone ID available")
+            self.send_error_notification("No zone ID available")
             return False
 
         # Get current setpoint before change
@@ -191,64 +214,82 @@ class HoneywellThermostat:
             return True
         except requests.exceptions.RequestException as e:
             print(f"Failed to set temperature: {e}")
+            self.send_error_notification(f"Failed to set temperature: {e}")
             return False
 
 def main():
     parser = argparse.ArgumentParser(description='Control Honeywell Thermostat')
     parser.add_argument('--temperature', type=float, required=True, help='Target temperature in Celsius')
     
-    args = parser.parse_args()
-    
-    # Get credentials from environment variables
-    email = os.getenv('HONEYWELL_EMAIL')
-    password = os.getenv('HONEYWELL_PASSWORD')
-    pushover_token = os.getenv('PUSHOVER_API_TOKEN')
-    
-    if not email or not password:
-        print("Error: Please set HONEYWELL_EMAIL and HONEYWELL_PASSWORD in your .env file")
-        sys.exit(1)
-    
-    # Initialize Pushover client if credentials are available
-    pushover_client = None
-    if pushover_token:
-        pushover_client = PushoverAPI(pushover_token)
-    
-    thermostat = HoneywellThermostat(email, password, pushover_client)
-    
-    if not thermostat.login():
-        sys.exit(1)
+    try:
+        args = parser.parse_args()
         
-    if not thermostat.get_locations():
-        print("Failed to get location information")
-        sys.exit(1)
+        # Get credentials from environment variables
+        email = os.getenv('HONEYWELL_EMAIL')
+        password = os.getenv('HONEYWELL_PASSWORD')
+        pushover_token = os.getenv('PUSHOVER_API_TOKEN')
+        pushover_user = os.getenv('PUSHOVER_USER_KEY')
         
-    if not thermostat.get_system_info():
-        print("Failed to get system information")
-        sys.exit(1)
+        if not email or not password:
+            raise ValueError("Please set HONEYWELL_EMAIL and HONEYWELL_PASSWORD in your .env file")
         
-    # Get current temperature before change
-    current_temp, current_setpoint = thermostat.get_current_temperature()
-    if current_temp is not None and current_setpoint is not None:
-        print(f"Current temperature: {current_temp}°C")
-        print(f"Current setpoint: {current_setpoint}°C")
-    
-    # Set new temperature
-    if not thermostat.set_temperature(args.temperature):
-        print("Failed to set temperature")
-        sys.exit(1)
-    
-    # Wait a moment for the change to take effect
-    print("Waiting for temperature change to take effect...")
-    time.sleep(2)
-    
-    # Get temperature after change
-    new_temp, new_setpoint = thermostat.get_current_temperature()
-    if new_temp is not None and new_setpoint is not None:
-        print(f"New temperature: {new_temp}°C")
-        print(f"New setpoint: {new_setpoint}°C")
+        if not pushover_token or not pushover_user:
+            print("Warning: Pushover credentials not set. Notifications will be disabled.")
         
-        if abs(new_setpoint - args.temperature) > 0.1:
-            print("Warning: New setpoint doesn't match requested temperature!")
+        # Initialize Pushover client if credentials are available
+        pushover_client = None
+        if pushover_token and pushover_user:
+            pushover_client = PushoverAPI(pushover_token)
+        
+        thermostat = HoneywellThermostat(email, password, pushover_client)
+        
+        if not thermostat.login():
+            raise RuntimeError("Failed to login to Honeywell service")
+            
+        if not thermostat.get_locations():
+            raise RuntimeError("Failed to get location information")
+            
+        if not thermostat.get_system_info():
+            raise RuntimeError("Failed to get system information")
+            
+        # Get current temperature before change
+        current_temp, current_setpoint = thermostat.get_current_temperature()
+        if current_temp is not None and current_setpoint is not None:
+            print(f"Current temperature: {current_temp}°C")
+            print(f"Current setpoint: {current_setpoint}°C")
+        else:
+            raise RuntimeError("Failed to get current temperature")
+        
+        # Set new temperature
+        if not thermostat.set_temperature(args.temperature):
+            raise RuntimeError("Failed to set temperature")
+        
+        # Wait a moment for the change to take effect
+        print("Waiting for temperature change to take effect...")
+        time.sleep(2)
+        
+        # Get temperature after change
+        new_temp, new_setpoint = thermostat.get_current_temperature()
+        if new_temp is not None and new_setpoint is not None:
+            print(f"New temperature: {new_temp}°C")
+            print(f"New setpoint: {new_setpoint}°C")
+            
+            if abs(new_setpoint - args.temperature) > 0.1:
+                raise RuntimeError(f"New setpoint ({new_setpoint}°C) doesn't match requested temperature ({args.temperature}°C)")
+        else:
+            raise RuntimeError("Failed to get updated temperature")
+
+    except Exception as e:
+        error_message = str(e)
+        stack_trace = traceback.format_exc()
+        print(f"Error: {error_message}")
+        print(f"Stack trace:\n{stack_trace}")
+        
+        # Send error notification if Pushover is configured
+        if 'thermostat' in locals() and thermostat.pushover:
+            thermostat.send_error_notification(error_message, stack_trace)
+        
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
